@@ -1,0 +1,182 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: graphrag-qdrant
+    ports:
+      - "6333:6333"   # REST/OpenAPI
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: graphrag-neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-testpassword}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_pagecache_size=512M
+      - NEO4J_dbms_memory_heap_max__size=1G
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+    ports:
+      - "7474:7474"   # Browser UI
+      - "7687:7687"   # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: graphrag-ollama
+    ports:
+      - "11434:11434"
+    environment:
+      # 2 slots so the embedding model (used during ingestion) and the
+      # chat/extraction model don't have to unload/reload each other on
+      # every batch - that swap was costing several seconds per batch once
+      # ingestion started alternating between the two. Only raise this if
+      # you have the GPU/RAM headroom for both models resident at once;
+      # check `docker stats` (or nvidia-smi) under load to confirm you're
+      # not swapping to disk instead.
+      - OLLAMA_MAX_LOADED_MODELS=2
+      # Raised from 1 so concurrent extraction calls issued by
+      # GRAPH_EXTRACTION_CONCURRENCY (api service, below) actually run
+      # concurrently on the Ollama side instead of queuing anyway. Higher
+      # values use more memory per concurrent request - reduce this (and/or
+      # GRAPH_EXTRACTION_CONCURRENCY) if you see OOM/slowdowns under load.
+      - OLLAMA_NUM_PARALLEL=3
+      - OLLAMA_KEEP_ALIVE=5m
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  api:
+    build: ./api
+    container_name: graphrag-api
+    ports:
+      - "8000:8000"
+    environment:
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_COLLECTION=chunks
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-testpassword}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - "EMBEDDING_DOC_PREFIX=${EMBEDDING_DOC_PREFIX:-search_document: }"
+      - "EMBEDDING_QUERY_PREFIX=${EMBEDDING_QUERY_PREFIX:-search_query: }"
+      - CHUNK_SIZE=800
+      - CHUNK_OVERLAP=120
+      - UPLOAD_DIR=/app/uploads
+      - MAX_UPLOAD_MB=300
+      - EMBED_BATCH_SIZE=${EMBED_BATCH_SIZE:-32}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1:8b}
+      - GRAPH_EXTRACTION_MODEL=${GRAPH_EXTRACTION_MODEL:-}
+      - GRAPH_EXTRACTION_MAX_TOKENS=${GRAPH_EXTRACTION_MAX_TOKENS:-1024}
+      - GRAPH_EXTRACTION_CONCURRENCY=${GRAPH_EXTRACTION_CONCURRENCY:-3}
+      - OLLAMA_TIMEOUT=${OLLAMA_TIMEOUT:-600}
+      - OLLAMA_RETRY_ATTEMPTS=${OLLAMA_RETRY_ATTEMPTS:-3}
+      - OLLAMA_RETRY_BASE_DELAY=${OLLAMA_RETRY_BASE_DELAY:-1.0}
+      - DOC_CONVERT_TIMEOUT_BASE=${DOC_CONVERT_TIMEOUT_BASE:-60}
+      - DOC_CONVERT_TIMEOUT_PER_MB=${DOC_CONVERT_TIMEOUT_PER_MB:-2}
+      - DOC_CONVERT_TIMEOUT_MAX=${DOC_CONVERT_TIMEOUT_MAX:-600}
+      - JSON_STREAMING_THRESHOLD_MB=${JSON_STREAMING_THRESHOLD_MB:-20}
+      - JSON_STRUCTURAL_EXTRACTION_ENABLED=${JSON_STRUCTURAL_EXTRACTION_ENABLED:-true}
+      - JSON_STRUCTURAL_MIN_COVERAGE=${JSON_STRUCTURAL_MIN_COVERAGE:-0.3}
+      - OCR_ENABLED=${OCR_ENABLED:-true}
+      - OCR_DPI=${OCR_DPI:-200}
+      - RAG_TOP_K=5
+      - RAG_GRAPH_EXPAND=5
+      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0}
+      - RAG_RRF_K=${RAG_RRF_K:-60}
+      - RAG_WEIGHT_VECTOR=${RAG_WEIGHT_VECTOR:-1.0}
+      - RAG_WEIGHT_ENTITY=${RAG_WEIGHT_ENTITY:-1.3}
+      - RAG_WEIGHT_GRAPH=${RAG_WEIGHT_GRAPH:-0.8}
+      - RAG_WEIGHT_KEYWORD=${RAG_WEIGHT_KEYWORD:-0.6}
+      - RAG_CANDIDATE_MULTIPLIER=${RAG_CANDIDATE_MULTIPLIER:-3}
+      - RAG_KEYWORD_SCROLL_LIMIT=${RAG_KEYWORD_SCROLL_LIMIT:-500}
+      - RAG_MAX_CHUNKS_PER_DOC=${RAG_MAX_CHUNKS_PER_DOC:-3}
+      - RAG_PATH_MAX_HOPS=${RAG_PATH_MAX_HOPS:-4}
+      - RAG_GRAPH_EXPAND_EXCLUDE_TYPES=${RAG_GRAPH_EXPAND_EXCLUDE_TYPES:-DATE}
+      - RAG_DEDUP_OVERLAP_THRESHOLD=${RAG_DEDUP_OVERLAP_THRESHOLD:-0.6}
+      - RAG_NEIGHBOR_WINDOW=${RAG_NEIGHBOR_WINDOW:-1}
+      - RAG_NEIGHBOR_EXPAND_TOP_N=${RAG_NEIGHBOR_EXPAND_TOP_N:-3}
+      - RAG_RERANK_ENABLED=${RAG_RERANK_ENABLED:-false}
+      - RAG_RERANK_POOL_MULTIPLIER=${RAG_RERANK_POOL_MULTIPLIER:-2}
+      - RAG_ASSIST_MODEL=${RAG_ASSIST_MODEL:-}
+      - RAG_CONDENSE_ENABLED=${RAG_CONDENSE_ENABLED:-false}
+      - RAG_CONDENSE_HISTORY_TURNS=${RAG_CONDENSE_HISTORY_TURNS:-4}
+      - RAG_QUERY_EXPANSION_ENABLED=${RAG_QUERY_EXPANSION_ENABLED:-false}
+      - RAG_QUERY_EXPANSION_COUNT=${RAG_QUERY_EXPANSION_COUNT:-2}
+      - RAG_AGENTIC_ENABLED=${RAG_AGENTIC_ENABLED:-false}
+      - RAG_AGENTIC_MAX_SUBQUESTIONS=${RAG_AGENTIC_MAX_SUBQUESTIONS:-4}
+      - RAG_AGENTIC_MAX_RETRIES=${RAG_AGENTIC_MAX_RETRIES:-2}
+      - RAG_AGENTIC_RELEVANCE_THRESHOLD=${RAG_AGENTIC_RELEVANCE_THRESHOLD:-5.0}
+      - RAG_AGENTIC_MIN_RELEVANT_RATIO=${RAG_AGENTIC_MIN_RELEVANT_RATIO:-0.4}
+      - SHOW_SOURCES_IN_CHAT=${SHOW_SOURCES_IN_CHAT:-true}
+    volumes:
+      - api_uploads:/app/uploads
+    depends_on:
+      qdrant:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: graphrag-openwebui
+    ports:
+      - "3000:8080"
+    environment:
+      # Only the RAG API is exposed as a backend, so every model in the
+      # OpenWebUI dropdown is automatically retrieval-augmented. The API
+      # itself proxies whichever models you've pulled into Ollama.
+      - ENABLE_OPENAI_API=true
+      - ENABLE_OLLAMA_API=false
+      - OPENAI_API_BASE_URLS=http://api:8000/v1
+      - OPENAI_API_KEYS=sk-local-not-checked
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-please-change-this-secret}
+      # OpenWebUI has its own separate, built-in RAG/knowledge subsystem
+      # (unrelated to our GraphRAG API) that needs its own embedding
+      # model - by default it uses a bundled sentence-transformers model
+      # and downloads it from HuggingFace on first use, which both
+      # requires internet and shows up as unexpected outbound traffic in
+      # the logs. This points that subsystem at the same local Ollama
+      # instance (and the same embedding model) our own pipeline already
+      # uses, instead of pulling in a second, separate model.
+      - RAG_EMBEDDING_ENGINE=ollama
+      - RAG_EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - RAG_OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      - openwebui_data:/app/backend/data
+    depends_on:
+      - api
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
+  ollama_data:
+  openwebui_data:
+  api_uploads:

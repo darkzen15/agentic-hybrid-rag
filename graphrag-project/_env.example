@@ -1,0 +1,173 @@
+# Copy this file to .env (same directory as docker-compose.yml) and adjust
+# as needed. A value only takes effect if it's both set here AND listed in
+# docker-compose.yml's `api:` service environment block - if you add a new
+# variable here, add it there too, or it silently never reaches the
+# container.
+
+NEO4J_PASSWORD=testpassword
+WEBUI_SECRET_KEY=please-change-this-secret
+
+# --- Models -----------------------------------------------------------------
+# Must match the *exact* tag shown by `docker compose exec ollama ollama
+# list` (e.g. "llama3.1:8b", not just "llama3.1" - Ollama treats an
+# untagged name as ":latest", a different tag than ":8b" unless you
+# specifically pulled ":latest"). A mismatch here doesn't fail loudly at
+# startup - it shows up later as a confusing 404 from Ollama on the first
+# request that needs the model. Check GET /health/detailed if you're ever
+# unsure this is wired correctly.
+OLLAMA_MODEL=llama3.1:8b
+EMBEDDING_MODEL=nomic-embed-text
+# Model used for LLM-based entity/relationship extraction during ingestion.
+# Optional - falls back to OLLAMA_MODEL if unset. Point this at a smaller/
+# faster model than your chat model if ingestion latency matters, since
+# extraction runs once per chunk.
+# GRAPH_EXTRACTION_MODEL=llama3.2:3b
+# Model override for retrieval's optional LLM-assist steps (query
+# condensation/expansion/reranking below). Optional - falls back to
+# GRAPH_EXTRACTION_MODEL, then OLLAMA_MODEL.
+# RAG_ASSIST_MODEL=llama3.2:3b
+
+# --- Ollama call tuning -------------------------------------------------------
+# How long (seconds) the API waits for Ollama before giving up. Larger/
+# memory-constrained models can take minutes to load on first use — raise
+# this if you see httpx.ReadTimeout in the API logs.
+OLLAMA_TIMEOUT=600
+# Retries transient Ollama failures (connection errors, timeouts, 5xx) with
+# backoff before giving up - guards large-file ingestion against a single
+# blip failing the whole job. 4xx responses (unknown model) are never
+# retried.
+OLLAMA_RETRY_ATTEMPTS=3
+OLLAMA_RETRY_BASE_DELAY=1.0
+
+# --- Ingestion ----------------------------------------------------------------
+# How many chunks are embedded per request to Ollama during ingestion.
+# Lower this (e.g. 8-16) if you're on constrained hardware and see timeouts
+# during ingestion of large files; raise it for faster ingestion on beefier
+# hardware.
+EMBED_BATCH_SIZE=32
+# Caps generation length (tokens) per chunk during entity/relationship
+# extraction, so a model rambling past its JSON answer doesn't waste
+# ingestion time. Raise if you see truncated/invalid JSON warnings on
+# chunks with a lot of entities.
+GRAPH_EXTRACTION_MAX_TOKENS=1024
+# How many chunks within a batch get their extraction requested
+# concurrently instead of one at a time - the main lever for large-file
+# ingestion throughput. Real speedup depends on OLLAMA_NUM_PARALLEL (set on
+# the ollama service in docker-compose.yml) being raised to match.
+GRAPH_EXTRACTION_CONCURRENCY=3
+# Legacy .doc -> .txt conversion (via LibreOffice) timeout scales with file
+# size: DOC_CONVERT_TIMEOUT_BASE + size_mb * DOC_CONVERT_TIMEOUT_PER_MB,
+# capped at DOC_CONVERT_TIMEOUT_MAX.
+DOC_CONVERT_TIMEOUT_BASE=60
+DOC_CONVERT_TIMEOUT_PER_MB=2
+DOC_CONVERT_TIMEOUT_MAX=600
+# Above this file size (MB), JSON is parsed with a streaming parser
+# instead of loading the whole file into memory at once.
+JSON_STREAMING_THRESHOLD_MB=20
+# When true (default), JSON files skip the LLM extraction call entirely
+# and derive entities/relationships directly from the JSON's own key
+# names and nesting instead - faster, free, deterministic, but only sees
+# what the structure tells it (a "notes" field with prose-mentioned
+# entities won't be caught this way). Set false to fall back to the same
+# LLM-based extraction used for every other file type.
+JSON_STRUCTURAL_EXTRACTION_ENABLED=true
+# Fraction (0-1) of a JSON record's scalar fields that must match a known
+# key hint before structural extraction's result is trusted. Below this,
+# ingest.py falls back to LLM extraction for that specific record instead
+# of accepting a thin/empty structural result - the self-correcting
+# safety net for schemas whose field names don't match the hint tables.
+# 0 disables the fallback (always trust structural extraction once
+# enabled); 1.0 falls back unless every scalar field matched.
+JSON_STRUCTURAL_MIN_COVERAGE=0.3
+# OCR fallback for scanned/image-only PDF pages (only engages for pages
+# where native text extraction finds nothing). Set to false to disable
+# even if the OCR packages are installed.
+OCR_ENABLED=true
+OCR_DPI=200
+
+# --- Retrieval: core fusion ---------------------------------------------------
+# Minimum vector similarity (0-1) a chunk needs to be used at all. 0 =
+# disabled (always uses the top-k closest chunks, however weak the match).
+# 0.3 is a reasonable starting point for nomic-embed-text; there's no safe
+# default to pick blindly since it depends on your embedding model and
+# data - see the README's "Improving retrieval quality" section for how
+# to find a good value using /retrieve before relying on this.
+RAG_MIN_SCORE=0.3
+# RRF constant (see retrieval.py/README) - rarely worth changing from the
+# standard value of 60.
+RAG_RRF_K=60
+# Per-channel weights in the RRF fusion. Entity-name matches default
+# higher since a query literally naming something in the graph is a very
+# strong relevance signal.
+RAG_WEIGHT_VECTOR=1.0
+RAG_WEIGHT_ENTITY=1.3
+RAG_WEIGHT_GRAPH=0.8
+RAG_WEIGHT_KEYWORD=0.6
+# How many candidates each channel pulls before fusion narrows to top_k.
+RAG_CANDIDATE_MULTIPLIER=3
+# How many chunks the keyword channel scrolls through before client-side
+# ranking - must stay well above top_k * RAG_CANDIDATE_MULTIPLIER.
+RAG_KEYWORD_SCROLL_LIMIT=500
+# Caps chunks from the same document in one merged result set.
+RAG_MAX_CHUNKS_PER_DOC=3
+# Max relationship hops when looking for a path between two named
+# entities mentioned in the same query.
+RAG_PATH_MAX_HOPS=4
+# Entity types excluded from graph-expansion traversal - comma-separated.
+# DATE is excluded by default: years are deliberately low-cardinality
+# (rounded to just the year), so a year like "2022" would otherwise
+# directly connect every chunk that mentions it, regardless of topic -
+# a hub entity that pollutes expansion with irrelevant results.
+RAG_GRAPH_EXPAND_EXCLUDE_TYPES=DATE
+# Drops a candidate whose text overlaps an already-selected chunk's text
+# by at least this fraction of words (near-duplicate suppression).
+RAG_DEDUP_OVERLAP_THRESHOLD=0.6
+# Neighbor-window expansion: for the top RAG_NEIGHBOR_EXPAND_TOP_N hits,
+# also pulls in the RAG_NEIGHBOR_WINDOW chunks immediately before/after
+# each (same document). Cheap (no LLM call) - on by default. Set
+# RAG_NEIGHBOR_WINDOW=0 to disable.
+RAG_NEIGHBOR_WINDOW=1
+RAG_NEIGHBOR_EXPAND_TOP_N=3
+
+# --- Retrieval: optional LLM-assist steps (each adds latency, off by default) -
+# Reranking: after RRF fusion, asks the LLM to score each candidate's
+# relevance directly, then re-sorts by that score before truncating to
+# top_k. Usually improves precision, costs one extra LLM call per query.
+RAG_RERANK_ENABLED=false
+RAG_RERANK_POOL_MULTIPLIER=2
+# Query condensation: for multi-turn chat, rewrites a follow-up like "what
+# about its founder?" into a standalone question using recent history
+# before retrieval. Costs one extra LLM call per turn.
+RAG_CONDENSE_ENABLED=false
+RAG_CONDENSE_HISTORY_TURNS=4
+# Query expansion: generates alternate phrasings of the query and searches
+# with each too, folding results into the vector channel. Costs N extra
+# embed+search round-trips.
+RAG_QUERY_EXPANSION_ENABLED=false
+RAG_QUERY_EXPANSION_COUNT=2
+
+# --- Agentic retrieval (off by default) ------------------------------------
+# Multi-step reasoning loop: decomposes complex queries into sub-questions,
+# retrieves for each, grades results for relevance, and self-corrects with
+# broadened search when retrieval is weak. Adds multiple LLM round-trips
+# per query - designed for strong models (120B+). /retrieve always stays
+# single-shot regardless of this toggle.
+RAG_AGENTIC_ENABLED=false
+# Max sub-questions the decomposition step can produce.
+RAG_AGENTIC_MAX_SUBQUESTIONS=4
+# How many times to reformulate and retry per sub-question when grading
+# says results are weak.
+RAG_AGENTIC_MAX_RETRIES=2
+# Minimum relevance score (0-10) from the grading LLM for a chunk to
+# survive. Below this it's discarded as irrelevant.
+RAG_AGENTIC_RELEVANCE_THRESHOLD=5.0
+# Fraction of top_k that must survive grading before the agent considers
+# results "good enough" and stops retrying. 0.4 with top_k=5 = at least
+# 2 relevant chunks.
+RAG_AGENTIC_MIN_RELEVANT_RATIO=0.4
+
+# --- Chat -----------------------------------------------------------------
+# Appends a "Sources retrieved" footer to /v1/chat/completions answers so
+# you can see what was actually pulled into context from inside a normal
+# chat UI (like OpenWebUI), without needing to call /retrieve separately.
+SHOW_SOURCES_IN_CHAT=true

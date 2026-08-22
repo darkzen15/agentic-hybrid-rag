@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hybrid GraphRAG — Ingest Documents</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --border: #2a2f3a;
+    --text: #e6e8ec;
+    --muted: #9aa3b2;
+    --accent: #5b8cff;
+    --ok: #4ade80;
+    --err: #f87171;
+    --warn: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 48px 20px;
+  }
+  .wrap { width: 100%; max-width: 720px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 28px; font-size: 14px; }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+
+  .fields { display: flex; gap: 12px; margin-bottom: 16px; }
+  .fields > div { flex: 1; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  input[type="text"] {
+    width: 100%;
+    background: #0f1115;
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 9px 10px;
+    border-radius: 8px;
+    font-size: 14px;
+  }
+  input[type="text"]:focus { outline: none; border-color: var(--accent); }
+
+  .dropzone {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 36px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .dropzone.drag { border-color: var(--accent); background: rgba(91,140,255,0.06); }
+  .dropzone strong { color: var(--text); }
+  .dropzone .types { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  input[type="file"] { display: none; }
+
+  .jobs { display: flex; flex-direction: column; gap: 10px; }
+  .job {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .job .name { flex: 1; min-width: 0; }
+  .job .name .fn { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .job .name .meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .progress { height: 4px; background: var(--border); border-radius: 999px; margin-top: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--accent); transition: width .3s ease; }
+  .badge {
+    font-size: 11px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+    white-space: nowrap;
+  }
+  .badge.queued { background: rgba(154,163,178,0.15); color: var(--muted); }
+  .badge.processing { background: rgba(251,191,36,0.15); color: var(--warn); }
+  .badge.stopping { background: rgba(251,191,36,0.15); color: var(--warn); }
+  .badge.done { background: rgba(74,222,128,0.15); color: var(--ok); }
+  .badge.error { background: rgba(248,113,113,0.15); color: var(--err); }
+  .badge.cancelled { background: rgba(154,163,178,0.15); color: var(--muted); }
+
+  .stop-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: border-color .15s, color .15s;
+  }
+  .stop-btn:hover { border-color: var(--err); color: var(--err); }
+  .stop-btn:disabled { opacity: 0.5; cursor: default; }
+
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 20px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ingest Documents</h1>
+  <p class="sub">Upload files into the hybrid vector + graph knowledge base.</p>
+
+  <div class="panel">
+    <div class="fields">
+      <div>
+        <label for="docId">Document ID (optional)</label>
+        <input type="text" id="docId" placeholder="auto-filled from filename" />
+      </div>
+      <div>
+        <label for="title">Title (optional)</label>
+        <input type="text" id="title" placeholder="auto-filled from filename" />
+      </div>
+    </div>
+
+    <div id="dropzone" class="dropzone">
+      <div><strong>Click to choose files</strong> or drag &amp; drop</div>
+      <div class="types">PDF · DOCX · DOC · CSV · XLSX · HTML · XML · JSON · EML · TXT · LOG · MD</div>
+      <input type="file" id="fileInput" multiple />
+    </div>
+  </div>
+
+  <div id="jobsPanel" class="panel">
+    <div id="jobsList" class="jobs">
+      <div class="empty">No uploads yet.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const jobsList = document.getElementById('jobsList');
+const docIdInput = document.getElementById('docId');
+const titleInput = document.getElementById('title');
+
+const trackedJobs = new Map(); // job_id -> job object
+const pollTimers = new Map();
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropzone.classList.remove('drag');
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', (e) => {
+  handleFiles(e.target.files);
+  fileInput.value = '';
+});
+
+function handleFiles(fileList) {
+  const files = Array.from(fileList);
+  if (!files.length) return;
+
+  // doc_id/title fields only make sense for a single file; for multiple
+  // files each keeps its own name-derived id.
+  const singleFile = files.length === 1;
+
+  files.forEach((file) => uploadFile(file, singleFile));
+}
+
+async function uploadFile(file, useFields) {
+  const formData = new FormData();
+  formData.append('file', file);
+  if (useFields && docIdInput.value.trim()) formData.append('doc_id', docIdInput.value.trim());
+  if (useFields && titleInput.value.trim()) formData.append('title', titleInput.value.trim());
+
+  const placeholderId = 'pending-' + Math.random().toString(36).slice(2);
+  upsertJobRow({
+    job_id: placeholderId,
+    filename: file.name,
+    doc_id: '',
+    status: 'uploading',
+    chunks_ingested: null,
+    error: null,
+  });
+
+  try {
+    const res = await fetch('/ingest/file', { method: 'POST', body: formData });
+    const data = await res.json();
+    removeJobRow(placeholderId);
+
+    if (!res.ok) {
+      upsertJobRow({
+        job_id: placeholderId,
+        filename: file.name,
+        doc_id: '',
+        status: 'error',
+        error: data.detail || 'Upload failed',
+      });
+      return;
+    }
+
+    upsertJobRow(data);
+    pollJob(data.job_id);
+  } catch (err) {
+    removeJobRow(placeholderId);
+    upsertJobRow({
+      job_id: placeholderId,
+      filename: file.name,
+      doc_id: '',
+      status: 'error',
+      error: String(err),
+    });
+  }
+}
+
+function pollJob(jobId) {
+  if (pollTimers.has(jobId)) return;
+  let consecutiveMisses = 0;
+  const maxMisses = 3; // stop after a few 404s in a row rather than polling forever
+
+  const timer = setInterval(async () => {
+    try {
+      const res = await fetch('/jobs/' + jobId);
+
+      if (res.status === 404) {
+        consecutiveMisses++;
+        if (consecutiveMisses >= maxMisses) {
+          clearInterval(pollTimers.get(jobId));
+          pollTimers.delete(jobId);
+          const existing = trackedJobs.get(jobId) || { filename: '(unknown file)' };
+          upsertJobRow({
+            ...existing,
+            job_id: jobId,
+            status: 'error',
+            error: 'Lost track of this job (the server may have restarted). Re-upload if needed.',
+          });
+        }
+        return;
+      }
+      consecutiveMisses = 0;
+
+      if (!res.ok) return; // transient error other than 404 — keep trying
+      const job = await res.json();
+      upsertJobRow(job);
+      if (job.status === 'done' || job.status === 'error' || job.status === 'cancelled') {
+        clearInterval(pollTimers.get(jobId));
+        pollTimers.delete(jobId);
+      }
+    } catch (e) { /* network hiccup — keep polling */ }
+  }, 1500);
+  pollTimers.set(jobId, timer);
+}
+
+async function cancelJob(jobId) {
+  // Optimistic UI: mark cancel_requested immediately so the button
+  // disables and the badge switches to "stopping" without waiting for
+  // the next poll tick. Cancellation is cooperative — the batch already
+  // in flight still has to finish (an Ollama call underway can't be
+  // aborted mid-request) — so status won't jump straight to "cancelled".
+  const job = trackedJobs.get(jobId);
+  if (job) upsertJobRow({ ...job, cancel_requested: true });
+
+  try {
+    const res = await fetch('/jobs/' + jobId + '/cancel', { method: 'POST' });
+    if (res.ok) {
+      upsertJobRow(await res.json());
+    }
+    // 404/409 (already finished by the time we asked) — the next poll
+    // tick, if any, will reconcile the real state; nothing to do here.
+  } catch (e) { /* network hiccup — next poll tick will reconcile */ }
+}
+
+function upsertJobRow(job) {
+  trackedJobs.set(job.job_id, job);
+  renderJobs();
+}
+
+function removeJobRow(jobId) {
+  trackedJobs.delete(jobId);
+  renderJobs();
+}
+
+function renderJobs() {
+  const jobs = Array.from(trackedJobs.values()).reverse();
+  if (!jobs.length) {
+    jobsList.innerHTML = '<div class="empty">No uploads yet.</div>';
+    return;
+  }
+  jobsList.innerHTML = jobs.map(renderJobRow).join('');
+}
+
+function renderJobRow(job) {
+  const status = job.status || 'queued';
+  const isCancellable = (status === 'queued' || status === 'processing') && !job.cancel_requested;
+  // While cancellation is pending but the loop hasn't actually stopped
+  // yet, show "stopping" instead of "processing" so it's clear the Stop
+  // click registered, even though the real status field is unchanged.
+  const displayStatus = (job.cancel_requested && (status === 'queued' || status === 'processing'))
+    ? 'stopping'
+    : status;
+
+  let metaText = job.doc_id ? ('doc_id: ' + job.doc_id) : '';
+  if (status === 'processing' && job.total_chunks) {
+    const processed = job.chunks_processed || 0;
+    const pct = Math.round((processed / job.total_chunks) * 100);
+    metaText += (metaText ? ' · ' : '') + processed + ' / ' + job.total_chunks + ' chunks (' + pct + '%)';
+  }
+  if ((status === 'done' || status === 'cancelled') && job.chunks_ingested != null) {
+    metaText += (metaText ? ' · ' : '') + job.chunks_ingested + ' chunks ingested';
+  }
+  if (status === 'error' && job.error) {
+    metaText += (metaText ? ' · ' : '') + job.error;
+  }
+  const progressBar = (status === 'processing' && job.total_chunks)
+    ? `<div class="progress"><div class="progress-fill" style="width:${Math.round((job.chunks_processed || 0) / job.total_chunks * 100)}%"></div></div>`
+    : '';
+  const stopButton = isCancellable
+    ? `<button class="stop-btn" onclick="cancelJob('${job.job_id}')">Stop</button>`
+    : '';
+  return `
+    <div class="job">
+      <div class="name">
+        <div class="fn">${escapeHtml(job.filename)}</div>
+        <div class="meta">${escapeHtml(metaText)}</div>
+        ${progressBar}
+      </div>
+      ${stopButton}
+      <div class="badge ${displayStatus}">${displayStatus}</div>
+    </div>
+  `;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
+// Load recent jobs on page load so a refresh doesn't lose history.
+(async function loadRecentJobs() {
+  try {
+    const res = await fetch('/jobs?limit=20');
+    if (!res.ok) return;
+    const jobs = await res.json();
+    jobs.reverse().forEach((job) => {
+      trackedJobs.set(job.job_id, job);
+      if (job.status === 'queued' || job.status === 'processing') pollJob(job.job_id);
+    });
+    renderJobs();
+  } catch (e) { /* ignore */ }
+})();
+</script>
+</body>
+</html>
